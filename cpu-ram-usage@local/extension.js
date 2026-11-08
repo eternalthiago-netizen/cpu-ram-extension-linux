@@ -2,6 +2,7 @@ import GObject from 'gi://GObject';
 import GLib from 'gi://GLib';
 import St from 'gi://St';
 import Clutter from 'gi://Clutter';
+import Gio from 'gi://Gio';
 import Pango from 'gi://Pango';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -52,17 +53,28 @@ function color(pct) {
 
 const Indicator = GObject.registerClass(
 class Indicator extends PanelMenu.Button {
-    _init() {
+    _init(path) {
         super._init(0.0, 'CPU & RAM Usage');
 
-        const box = new St.BoxLayout({style_class: 'panel-status-menu-box'});
-        this._cpu = new St.Label({text: 'CPU …', y_align: Clutter.ActorAlign.CENTER});
-        const sep = new St.Label({text: ' · ', y_align: Clutter.ActorAlign.CENTER});
-        this._ram = new St.Label({text: 'RAM …', y_align: Clutter.ActorAlign.CENTER});
-        for (const l of [this._cpu, sep, this._ram]) {
+        const icon = name => new St.Icon({
+            gicon: Gio.icon_new_for_string(`${path}/icons/${name}-symbolic.svg`),
+            style_class: 'system-status-icon',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        const label = text => {
+            const l = new St.Label({text, y_align: Clutter.ActorAlign.CENTER});
             l.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
-            box.add_child(l);
-        }
+            return l;
+        };
+
+        const box = new St.BoxLayout({style_class: 'panel-status-menu-box'});
+        this._cpuIcon = icon('cpu');
+        this._cpu = label('…');
+        this._ramIcon = icon('ram');
+        this._ram = label('…');
+        const sep = label('  ');
+        for (const a of [this._cpuIcon, this._cpu, sep, this._ramIcon, this._ram])
+            box.add_child(a);
         this.add_child(box);
 
         this._cpuItem = new PopupMenu.PopupMenuItem('CPU', {reactive: false});
@@ -89,10 +101,10 @@ class Indicator extends PanelMenu.Button {
             const mem = readMemory();
             const ram = mem.total > 0 ? Math.round(100 * mem.used / mem.total) : 0;
 
-            this._cpu.text = `CPU ${cpu}%`;
-            this._ram.text = `RAM ${ram}%`;
-            this._cpu.style = color(cpu);
-            this._ram.style = color(ram);
+            this._cpu.text = `${cpu}%`;
+            this._ram.text = `${ram}%`;
+            this._cpu.style = this._cpuIcon.style = color(cpu);
+            this._ram.style = this._ramIcon.style = color(ram);
             this._cpuItem.label.text = `CPU: ${cpu}%`;
             this._ramItem.label.text =
                 `RAM: ${ram}% (${gib(mem.used)} of ${gib(mem.total)} GiB)`;
@@ -112,7 +124,7 @@ class Indicator extends PanelMenu.Button {
 
 export default class CpuRamUsageExtension extends Extension {
     enable() {
-        this._indicator = new Indicator();
+        this._indicator = new Indicator(this.path);
         Main.panel.addToStatusArea(this.uuid, this._indicator, 0, 'right');
     }
 

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <path fill="#bebebe" fill-rule="evenodd" d="M1 4h14a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H1a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zm1 1.5v4h12v-4z"/>
+  <rect fill="#bebebe" x="3.5" y="6.5" width="2" height="2"/>
+  <rect fill="#bebebe" x="7" y="6.5" width="2" height="2"/>
+  <rect fill="#bebebe" x="10.5" y="6.5" width="2" height="2"/>
+  <path fill="#bebebe" d="M2 12h1v2H2zM4.5 12h1v2h-1zM7 12h1v2H7zM9.5 12h1v2h-1zM12 12h1v2h-1z"/>
+</svg>

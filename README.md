@@ -1,7 +1,8 @@
 # CPU & RAM Usage for GNOME
 
-GNOME Shell extension that shows your CPU and RAM usage in the top bar (`CPU 12% · RAM 41%`).
+GNOME Shell extension that shows your CPU and RAM usage in the top bar (a CPU chip icon and a RAM icon with percentages, e.g. `12%  41%`).
 
+- Compact icons instead of text labels; the icons follow the panel theme.
 - Each value turns orange from 80% and red from 90%.
 - The menu shows RAM used and total in GiB.
 - Refreshes every 2 seconds.
@@ -13,8 +14,8 @@ The extension reads `/proc/stat` (CPU) and `/proc/meminfo` (RAM) directly. RAM "
 ## Install
 
 ```bash
-./build-deb.sh            # builds dist/gnome-cpu-ram-usage_1.0.0_all.deb
-sudo apt install ./dist/gnome-cpu-ram-usage_1.0.0_all.deb
+./build-deb.sh            # builds dist/gnome-cpu-ram-usage_1.1.0_all.deb
+sudo apt install ./dist/gnome-cpu-ram-usage_1.1.0_all.deb
 gnome-extensions enable cpu-ram-usage@local
 ```
 
