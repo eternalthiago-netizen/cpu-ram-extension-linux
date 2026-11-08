@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="${1:-1.0.0}"
+VERSION="${1:-1.1.0}"
 MAINTAINER="eternalthiago-netizen <322351893+eternalthiago-netizen@users.noreply.github.com>"
 BUILD=build
 rm -rf "$BUILD" && mkdir -p "$BUILD" dist

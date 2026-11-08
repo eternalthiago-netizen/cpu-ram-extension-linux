@@ -23,7 +23,7 @@ Restart GNOME Shell (X11: Alt+F2, `r`, Enter; Wayland: log out and back in).
 
 Without the package, copy the `cpu-ram-usage@local` folder to `~/.local/share/gnome-shell/extensions/`.
 
-For another version: `./build-deb.sh 1.1.0`.
+For another version: `./build-deb.sh 1.2.0`.
 
 ## Requirements
 
