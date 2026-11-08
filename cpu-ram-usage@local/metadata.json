@@ -1,0 +1,6 @@
+{
+  "uuid": "cpu-ram-usage@local",
+  "name": "CPU & RAM Usage",
+  "description": "Shows CPU and RAM usage percentages in the top bar.",
+  "shell-version": ["45", "46", "47", "48", "49"]
+}
