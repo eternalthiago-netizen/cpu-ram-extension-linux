@@ -43,12 +43,151 @@ function gib(kib) {
     return (kib / 1048576).toFixed(1);
 }
 
+function readFirstLine(path) {
+    try {
+        return readText(path).trim();
+    } catch {
+        return null;
+    }
+}
+
+function listDir(path) {
+    const names = [];
+    try {
+        const dir = GLib.Dir.open(path, 0);
+        let name;
+        while ((name = dir.read_name()) !== null)
+            names.push(name);
+        dir.close();
+    } catch {}
+    return names.sort();
+}
+
+// hwmon drivers that report the CPU temperature, and the preferred sensor label
+const CPU_SENSORS = {coretemp: /^Package id/, k10temp: /^(Tctl|Tdie)$/, zenpower: /^(Tctl|Tdie)$/};
+
+// Path of a temp*_input file: the labelled sensor if there is one, else temp1
+function hwmonInput(dir, preferred) {
+    const inputs = listDir(dir).filter(n => /^temp\d+_input$/.test(n));
+    const labelled = preferred && inputs.find(n =>
+        preferred.test(readFirstLine(`${dir}/${n.replace('_input', '_label')}`) ?? ''));
+    const pick = labelled ?? (inputs.includes('temp1_input') ? 'temp1_input' : inputs[0]);
+    return pick ? `${dir}/${pick}` : null;
+}
+
+// hwmon drivers that report a GPU temperature (AMD, open-source NVIDIA)
+const GPU_SENSORS = {amdgpu: /^edge$/, nouveau: null};
+
+// The proprietary NVIDIA driver has no hwmon sensor: its temperature comes
+// from nvidia-smi. Returns the PCI device dir, used to skip a sleeping GPU.
+function findNvidiaGpu() {
+    if (!GLib.find_program_in_path('nvidia-smi'))
+        return null;
+    for (const d of listDir('/sys/bus/pci/devices')) {
+        const dir = `/sys/bus/pci/devices/${d}`;
+        if (readFirstLine(`${dir}/vendor`) === '0x10de' &&
+            readFirstLine(`${dir}/class`)?.startsWith('0x03'))
+            return dir;
+    }
+    return null;
+}
+
+// Found once at startup; null when the machine exposes no such sensor
+function findTempSensors() {
+    let cpu = null, disk = null, gpu = null;
+    for (const h of listDir('/sys/class/hwmon')) {
+        const dir = `/sys/class/hwmon/${h}`;
+        const name = readFirstLine(`${dir}/name`);
+        if (!cpu && name in CPU_SENSORS)
+            cpu = hwmonInput(dir, CPU_SENSORS[name]);
+        else if (!disk && name === 'nvme')
+            disk = hwmonInput(dir, /^Composite$/);
+        else if (!gpu && name in GPU_SENSORS)
+            gpu = hwmonInput(dir, GPU_SENSORS[name]);
+    }
+    const nvidia = gpu ? null : findNvidiaGpu();
+    // Fallback: the kernel's package thermal zone
+    for (const z of cpu ? [] : listDir('/sys/class/thermal')) {
+        if (readFirstLine(`/sys/class/thermal/${z}/type`) === 'x86_pkg_temp') {
+            cpu = `/sys/class/thermal/${z}/temp`;
+            break;
+        }
+    }
+    return {cpu, disk, gpu, nvidia};
+}
+
+// Degrees Celsius, or null if the sensor cannot be read
+function readTemp(path) {
+    const milli = path ? Number(readFirstLine(path)) : NaN;
+    return Number.isFinite(milli) && milli > 0 ? Math.round(milli / 1000) : null;
+}
+
+// NVIDIA temperature via nvidia-smi: a number, 'off' when the GPU is asleep
+// (querying it would wake it up and drain the battery), or null on failure
+function readNvidiaTemp(pciDir) {
+    if (readFirstLine(`${pciDir}/power/runtime_status`) === 'suspended')
+        return Promise.resolve('off');
+    return new Promise(resolve => {
+        try {
+            const proc = Gio.Subprocess.new(
+                ['nvidia-smi', '--query-gpu=temperature.gpu', '--format=csv,noheader,nounits'],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE);
+            proc.communicate_utf8_async(null, null, (p, res) => {
+                try {
+                    const c = parseInt(p.communicate_utf8_finish(res)[1], 10);
+                    resolve(Number.isFinite(c) ? c : null);
+                } catch {
+                    resolve(null);
+                }
+            });
+        } catch {
+            resolve(null);
+        }
+    });
+}
+
 function color(pct) {
     if (pct >= 90)
         return 'color: #ff6b6b;';
     if (pct >= 80)
         return 'color: #ffb347;';
     return '';
+}
+
+// Warning colors from mildest to worst
+const SEVERITY = ['color: #ffb347;', 'color: #ff6b6b;'];
+
+// Most laptop CPUs and GPUs throttle around 100 °C
+function tempColor(c) {
+    if (c >= 95)
+        return 'color: #ff6b6b;';
+    if (c >= 85)
+        return 'color: #ffb347;';
+    return '';
+}
+
+// What the top bar shows; chosen from the menu and kept across restarts
+const SETTINGS_FILE = GLib.build_filenamev([GLib.get_user_config_dir(), 'cpu-ram-usage.json']);
+const DEFAULTS = {cpu: true, cpuTemp: true, ram: true, gpuTemp: false};
+const BAR_OPTIONS = [
+    ['cpu', 'CPU usage'], ['cpuTemp', 'CPU temperature'],
+    ['ram', 'RAM usage'], ['gpuTemp', 'GPU temperature'],
+];
+
+function loadSettings() {
+    try {
+        return {...DEFAULTS, ...JSON.parse(readText(SETTINGS_FILE))};
+    } catch {
+        return {...DEFAULTS};
+    }
+}
+
+function saveSettings(settings) {
+    try {
+        GLib.file_set_contents(SETTINGS_FILE, JSON.stringify(settings));
+    } catch (e) {
+        logError(e);
+    }
 }
 
 const Indicator = GObject.registerClass(
@@ -67,21 +206,64 @@ class Indicator extends PanelMenu.Button {
             return l;
         };
 
-        const box = new St.BoxLayout({style_class: 'panel-status-menu-box'});
+        this._sensors = findTempSensors();
+        this._settings = loadSettings();
+
+        // One group per icon: CPU (usage + temperature), RAM, GPU
         this._cpuIcon = icon('cpu');
         this._cpu = label('…');
+        this._cpuTemp = label('');
         this._ramIcon = icon('ram');
         this._ram = label('…');
-        const sep = label('  ');
-        for (const a of [this._cpuIcon, this._cpu, sep, this._ramIcon, this._ram])
-            box.add_child(a);
+        this._gpuIcon = icon('gpu');
+        this._gpuTemp = label('…');
+        const box = new St.BoxLayout({style_class: 'panel-status-menu-box'});
+        this._groups = [
+            [this._cpuIcon, this._cpu, this._cpuTemp],
+            [this._ramIcon, this._ram],
+            [this._gpuIcon, this._gpuTemp],
+        ].map(children => {
+            const group = new St.BoxLayout();
+            for (const c of children)
+                group.add_child(c);
+            box.add_child(group);
+            return group;
+        });
         this.add_child(box);
 
         this._cpuItem = new PopupMenu.PopupMenuItem('CPU', {reactive: false});
         this._ramItem = new PopupMenu.PopupMenuItem('RAM', {reactive: false});
-        this.menu.addMenuItem(this._cpuItem);
-        this.menu.addMenuItem(this._ramItem);
+        this._gpuItem = new PopupMenu.PopupMenuItem('GPU', {reactive: false});
+        this._diskItem = new PopupMenu.PopupMenuItem('SSD', {reactive: false});
+        this._gpuItem.visible = this._hasGpu();
+        this._diskItem.visible = this._sensors.disk !== null;
+        for (const item of [this._cpuItem, this._ramItem, this._gpuItem, this._diskItem])
+            this.menu.addMenuItem(item);
 
+        // Switches for what the top bar shows (temperatures only if there is a sensor)
+        const bar = new PopupMenu.PopupSubMenuMenuItem('Show in top bar');
+        for (const [key, text] of BAR_OPTIONS) {
+            if ((key === 'cpuTemp' && !this._sensors.cpu) || (key === 'gpuTemp' && !this._hasGpu()))
+                continue;
+            const sw = new PopupMenu.PopupSwitchMenuItem(text, this._settings[key]);
+            sw.connect('toggled', (_item, state) => {
+                this._settings[key] = state;
+                saveSettings(this._settings);
+                this._layout();
+                this._update();
+            });
+            bar.menu.addMenuItem(sw);
+        }
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this.menu.addMenuItem(bar);
+
+        // Refresh at once on open, so the GPU line is current
+        this.menu.connect('open-state-changed', (_m, open) => {
+            if (open)
+                this._update();
+        });
+
+        this._layout();
         this._prev = readCpuTimes();
         this._update();
         this._timer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, POLL_SECONDS, () => {
@@ -90,24 +272,93 @@ class Indicator extends PanelMenu.Button {
         });
     }
 
-    _update() {
+    _hasGpu() {
+        return this._sensors.gpu !== null || this._sensors.nvidia !== null;
+    }
+
+    _show(key) {
+        if (key === 'cpuTemp' && !this._sensors.cpu)
+            return false;
+        if (key === 'gpuTemp' && !this._hasGpu())
+            return false;
+        return this._settings[key];
+    }
+
+    // Shows only the chosen values; keeps the CPU icon if nothing is chosen,
+    // so there is still something to click
+    _layout() {
+        const s = key => this._show(key);
+        this._cpu.visible = s('cpu');
+        this._cpuTemp.visible = s('cpuTemp');
+        this._ram.visible = this._ramIcon.visible = s('ram');
+        this._gpuTemp.visible = this._gpuIcon.visible = s('gpuTemp');
+        const shown = [s('cpu') || s('cpuTemp'), s('ram'), s('gpuTemp')];
+        if (!shown.includes(true))
+            shown[0] = true;
+        let first = true;
+        this._groups.forEach((group, i) => {
+            group.visible = shown[i];
+            group.style = shown[i] && !first ? 'margin-left: 10px;' : '';
+            if (shown[i])
+                first = false;
+        });
+        this._cpuIcon.visible = true;
+    }
+
+    async _readGpuTemp() {
+        if (this._sensors.gpu)
+            return readTemp(this._sensors.gpu);
+        return this._sensors.nvidia ? await readNvidiaTemp(this._sensors.nvidia) : null;
+    }
+
+    async _update() {
         try {
-            const cur = readCpuTimes();
-            const dTotal = cur.total - this._prev.total;
-            const dIdle = cur.idle - this._prev.idle;
-            this._prev = cur;
-            const cpu = dTotal > 0 ? Math.round(100 * (1 - dIdle / dTotal)) : 0;
+            // Extra refreshes (menu opened, switch toggled) reuse the last sample:
+            // a new one over a few milliseconds would read as 0% or 100%
+            const now = GLib.get_monotonic_time();
+            if (this._cpuPct === undefined || now - this._sampledAt >= 1e6) {
+                const cur = readCpuTimes();
+                const dTotal = cur.total - this._prev.total;
+                const dIdle = cur.idle - this._prev.idle;
+                this._prev = cur;
+                this._sampledAt = now;
+                this._cpuPct = dTotal > 0 ? Math.round(100 * (1 - dIdle / dTotal)) : 0;
+            }
+            const cpu = this._cpuPct;
 
             const mem = readMemory();
             const ram = mem.total > 0 ? Math.round(100 * mem.used / mem.total) : 0;
 
+            const temp = readTemp(this._sensors.cpu);
             this._cpu.text = `${cpu}%`;
+            this._cpuTemp.text = temp === null ? '' : `${this._show('cpu') ? ' ' : ''}${temp}°`;
             this._ram.text = `${ram}%`;
-            this._cpu.style = this._cpuIcon.style = color(cpu);
+            this._cpu.style = color(cpu);
+            this._cpuTemp.style = temp === null ? '' : tempColor(temp);
+            // The icon takes the worse of the two CPU colors shown
+            const styles = [
+                this._show('cpu') ? color(cpu) : '',
+                this._show('cpuTemp') && temp !== null ? tempColor(temp) : '',
+            ];
+            this._cpuIcon.style = SEVERITY.findLast(c => styles.includes(c)) ?? '';
             this._ram.style = this._ramIcon.style = color(ram);
-            this._cpuItem.label.text = `CPU: ${cpu}%`;
+            this._cpuItem.label.text = temp === null ? `CPU: ${cpu}%` : `CPU: ${cpu}% · ${temp} °C`;
             this._ramItem.label.text =
                 `RAM: ${ram}% (${gib(mem.used)} of ${gib(mem.total)} GiB)`;
+            this._diskItem.label.text = `SSD: ${readTemp(this._sensors.disk) ?? '—'} °C`;
+
+            // GPU: only when shown in the bar or the menu is open (nvidia-smi is a process)
+            if (this._hasGpu() && (this._show('gpuTemp') || this.menu.isOpen) && !this._gpuBusy) {
+                this._gpuBusy = true;
+                const gpu = await this._readGpuTemp();
+                this._gpuBusy = false;
+                if (!this._timer)  // destroyed while waiting
+                    return;
+                const off = gpu === 'off';
+                this._gpuTemp.text = off ? 'off' : `${gpu ?? '—'}°`;
+                this._gpuTemp.style = this._gpuIcon.style = typeof gpu === 'number' ? tempColor(gpu) : '';
+                this._gpuItem.label.text = off ? 'GPU: sleeping' : `GPU: ${gpu ?? '—'} °C`;
+            }
         } catch (e) {
             logError(e);
         }

@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="${1:-1.1.0}"
+VERSION="${1:-1.2.0}"
 MAINTAINER="eternalthiago-netizen <322351893+eternalthiago-netizen@users.noreply.github.com>"
 BUILD=build
 rm -rf "$BUILD" && mkdir -p "$BUILD" dist
@@ -20,9 +20,10 @@ Maintainer: $MAINTAINER
 Depends: gnome-shell (>= 45)
 Section: gnome
 Priority: optional
-Description: CPU and RAM usage percentages in the GNOME top bar
- Shows the current CPU and RAM usage in the top bar, turning orange from
- 80% and red from 90%. Reads /proc directly; no helper process.
+Description: CPU/RAM usage and CPU/GPU temperatures in the GNOME top bar
+ Shows CPU and RAM usage and CPU/GPU temperatures in the top bar, with
+ colors for high values; the menu chooses what is shown. Reads /proc and
+ /sys directly; uses nvidia-smi for NVIDIA GPUs.
 EOF
 cat > "$P/DEBIAN/postinst" <<'EOF'
 #!/bin/sh

@@ -1,6 +1,6 @@
 {
   "uuid": "cpu-ram-usage@local",
   "name": "CPU & RAM Usage",
-  "description": "Shows CPU and RAM usage percentages in the top bar.",
+  "description": "Shows CPU and RAM usage and CPU/GPU temperatures in the top bar; choose what is shown from the menu.",
   "shell-version": ["45", "46", "47", "48", "49"]
 }
