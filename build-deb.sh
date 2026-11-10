@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="${1:-1.3.0}"
+VERSION="${1:-1.4.0}"
 MAINTAINER="eternalthiago-netizen <322351893+eternalthiago-netizen@users.noreply.github.com>"
 BUILD=build
 rm -rf "$BUILD" && mkdir -p "$BUILD" dist
@@ -23,7 +23,8 @@ Priority: optional
 Description: CPU/RAM usage, CPU/GPU temperatures and disk activity in the GNOME top bar
  Shows CPU and RAM usage, CPU/GPU temperatures and disk activity and
  read/write speed in the top bar, with
- colors for high values; the menu chooses what is shown. Reads /proc and
+ colors for high values; the menu chooses what is shown, and hidden items
+ appear while they are at a warning level. Reads /proc and
  /sys directly; uses nvidia-smi for NVIDIA GPUs.
 EOF
 cat > "$P/DEBIAN/postinst" <<'EOF'

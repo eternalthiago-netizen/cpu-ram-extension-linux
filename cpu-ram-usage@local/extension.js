@@ -207,12 +207,22 @@ function tempColor(c) {
 
 // What the top bar shows; chosen from the menu and kept across restarts
 const SETTINGS_FILE = GLib.build_filenamev([GLib.get_user_config_dir(), 'cpu-ram-usage.json']);
-const DEFAULTS = {cpu: true, cpuTemp: true, ram: true, gpuTemp: false, diskBusy: true, diskRate: true};
+const DEFAULTS = {
+    cpu: true, cpuTemp: true, ram: true, gpuTemp: false,
+    diskBusy: true, diskRate: true, diskSpace: false, autoShow: true,
+};
 const BAR_OPTIONS = [
     ['cpu', 'CPU usage'], ['cpuTemp', 'CPU temperature'],
     ['ram', 'RAM usage'], ['gpuTemp', 'GPU temperature'],
     ['diskBusy', 'Disk activity'], ['diskRate', 'Disk read/write'],
+    ['diskSpace', 'Disk space'],
 ];
+
+// With autoShow, a hidden item appears while its value is at a warning level
+// (the orange threshold) and stays this long after it drops, so spikes don't flicker
+const ALERT_HOLD_SECONDS = 30;
+// Hidden GPU: checked this often for alerts only (nvidia-smi is a process)
+const GPU_ALERT_POLL_SECONDS = 10;
 
 function loadSettings() {
     try {
@@ -261,12 +271,14 @@ class Indicator extends PanelMenu.Button {
         this._diskIcon = icon('disk');
         this._diskBusy = label('…');
         this._diskRate = label('');
+        this._diskSpace = label('');
+        this._alertUntil = {};
         const box = new St.BoxLayout({style_class: 'panel-status-menu-box'});
         this._groups = [
             [this._cpuIcon, this._cpu, this._cpuTemp],
             [this._ramIcon, this._ram],
             [this._gpuIcon, this._gpuTemp],
-            [this._diskIcon, this._diskBusy, this._diskRate],
+            [this._diskIcon, this._diskBusy, this._diskRate, this._diskSpace],
         ].map(children => {
             const group = new St.BoxLayout();
             for (const c of children)
@@ -303,6 +315,15 @@ class Indicator extends PanelMenu.Button {
             });
             bar.menu.addMenuItem(sw);
         }
+        bar.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        const auto = new PopupMenu.PopupSwitchMenuItem('Show hidden items when high', this._settings.autoShow);
+        auto.connect('toggled', (_item, state) => {
+            this._settings.autoShow = state;
+            saveSettings(this._settings);
+            this._layout();
+            this._update();
+        });
+        bar.menu.addMenuItem(auto);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this.menu.addMenuItem(bar);
 
@@ -336,12 +357,25 @@ class Indicator extends PanelMenu.Button {
         return true;
     }
 
+    // Shown in the bar: chosen in the menu, or (with autoShow) recently at a warning level
     _show(key) {
-        return this._available(key) && this._settings[key];
+        if (!this._available(key))
+            return false;
+        return this._settings[key] ||
+            (this._settings.autoShow && (this._alertUntil[key] ?? 0) > GLib.get_monotonic_time());
     }
 
-    // Shows only the chosen values; keeps the CPU icon if nothing is chosen,
-    // so there is still something to click
+    // A value is at a warning level when it gets a color
+    _markAlerts(styles) {
+        const until = GLib.get_monotonic_time() + ALERT_HOLD_SECONDS * 1e6;
+        for (const [key, style] of Object.entries(styles)) {
+            if (style)
+                this._alertUntil[key] = until;
+        }
+    }
+
+    // Shows only the chosen (or alerting) values; keeps the CPU icon if nothing
+    // is shown, so there is still something to click
     _layout() {
         const s = key => this._show(key);
         this._cpu.visible = s('cpu');
@@ -350,7 +384,9 @@ class Indicator extends PanelMenu.Button {
         this._gpuTemp.visible = this._gpuIcon.visible = s('gpuTemp');
         this._diskBusy.visible = s('diskBusy');
         this._diskRate.visible = s('diskRate');
-        const shown = [s('cpu') || s('cpuTemp'), s('ram'), s('gpuTemp'), s('diskBusy') || s('diskRate')];
+        this._diskSpace.visible = s('diskSpace');
+        const shown = [s('cpu') || s('cpuTemp'), s('ram'), s('gpuTemp'),
+            s('diskBusy') || s('diskRate') || s('diskSpace')];
         if (!shown.includes(true))
             shown[0] = true;
         let first = true;
@@ -395,60 +431,96 @@ class Indicator extends PanelMenu.Button {
                 this._io = {busy: Math.min(100, Math.round(busy)), read: read / secs, written: written / secs};
                 this._sampledAt = now;
             }
-            const cpu = this._cpuPct;
-            const io = this._io;
 
             const mem = readMemory();
-            const ram = mem.total > 0 ? Math.round(100 * mem.used / mem.total) : 0;
-
-            const temp = readTemp(this._sensors.cpu);
-            this._cpu.text = `${cpu}%`;
-            this._cpuTemp.text = temp === null ? '' : `${this._show('cpu') ? ' ' : ''}${temp}°`;
-            this._ram.text = `${ram}%`;
-            this._cpu.style = color(cpu);
-            this._cpuTemp.style = temp === null ? '' : tempColor(temp);
-            // The icon takes the worse of the two CPU colors shown
-            const styles = [
-                this._show('cpu') ? color(cpu) : '',
-                this._show('cpuTemp') && temp !== null ? tempColor(temp) : '',
-            ];
-            this._cpuIcon.style = SEVERITY.findLast(c => styles.includes(c)) ?? '';
-            this._ram.style = this._ramIcon.style = color(ram);
-            this._cpuItem.label.text = temp === null ? `CPU: ${cpu}%` : `CPU: ${cpu}% · ${temp} °C`;
-            this._ramItem.label.text =
-                `RAM: ${ram}% (${gib(mem.used)} of ${gib(mem.total)} GiB)`;
-            this._diskItem.label.text = `SSD temperature: ${readTemp(this._sensors.disk) ?? '—'} °C`;
-
-            this._diskBusy.text = `${io.busy}%`;
-            this._diskRate.text = `${this._show('diskBusy') ? ' ' : ''}R ${rate(io.read)} W ${rate(io.written)}`;
-            this._diskBusy.style = this._diskIcon.style = color(io.busy);
-            const mbs = b => (b / 1048576).toFixed(1);
-            this._ioItem.label.text =
-                `Disk: ${io.busy}% busy · read ${mbs(io.read)} MB/s · write ${mbs(io.written)} MB/s`;
+            let space = null;
             try {
-                const sp = rootSpace();
-                this._spaceItem.label.text =
-                    `Space: ${sp.pct}% (${gib(sp.used / 1024)} of ${gib(sp.size / 1024)} GiB)`;
-                this._spaceItem.label.style = color(sp.pct);
-            } catch {
-                this._spaceItem.label.text = 'Space: —';
-            }
+                space = rootSpace();
+            } catch {}
+            const v = {
+                cpu: this._cpuPct,
+                temp: readTemp(this._sensors.cpu),
+                mem,
+                ram: mem.total > 0 ? Math.round(100 * mem.used / mem.total) : 0,
+                io: this._io,
+                space,
+                diskTemp: readTemp(this._sensors.disk),
+            };
+            this._v = v;
+            this._markAlerts({
+                cpu: color(v.cpu),
+                cpuTemp: v.temp !== null && tempColor(v.temp),
+                ram: color(v.ram),
+                diskBusy: color(v.io.busy),
+                diskSpace: space && color(space.pct),
+            });
+            this._render();
 
-            // GPU: only when shown in the bar or the menu is open (nvidia-smi is a process)
-            if (this._hasGpu() && (this._show('gpuTemp') || this.menu.isOpen) && !this._gpuBusy) {
+            // GPU: when shown, when the menu is open, or now and then to catch an alert
+            const forAlert = this._settings.autoShow &&
+                now - (this._gpuReadAt ?? 0) >= GPU_ALERT_POLL_SECONDS * 1e6;
+            if (this._hasGpu() && (this._show('gpuTemp') || this.menu.isOpen || forAlert) && !this._gpuBusy) {
                 this._gpuBusy = true;
+                this._gpuReadAt = now;
                 const gpu = await this._readGpuTemp();
                 this._gpuBusy = false;
                 if (!this._timer)  // destroyed while waiting
                     return;
-                const off = gpu === 'off';
-                this._gpuTemp.text = off ? 'off' : `${gpu ?? '—'}°`;
-                this._gpuTemp.style = this._gpuIcon.style = typeof gpu === 'number' ? tempColor(gpu) : '';
-                this._gpuItem.label.text = off ? 'GPU: sleeping' : `GPU: ${gpu ?? '—'} °C`;
+                this._gpu = gpu;
+                this._markAlerts({gpuTemp: typeof gpu === 'number' && tempColor(gpu)});
+                this._render();
             }
         } catch (e) {
             logError(e);
         }
+    }
+
+    _render() {
+        const {cpu, temp, mem, ram, io, space, diskTemp} = this._v;
+        this._layout();
+        const gap = key => (this._show(key) ? ' ' : '');
+
+        this._cpu.text = `${cpu}%`;
+        this._cpuTemp.text = temp === null ? '' : `${gap('cpu')}${temp}°`;
+        this._cpu.style = color(cpu);
+        this._cpuTemp.style = temp === null ? '' : tempColor(temp);
+        // The icon takes the worse of the two CPU colors shown
+        const styles = [
+            this._show('cpu') ? color(cpu) : '',
+            this._show('cpuTemp') && temp !== null ? tempColor(temp) : '',
+        ];
+        this._cpuIcon.style = SEVERITY.findLast(c => styles.includes(c)) ?? '';
+        this._cpuItem.label.text = temp === null ? `CPU: ${cpu}%` : `CPU: ${cpu}% · ${temp} °C`;
+
+        this._ram.text = `${ram}%`;
+        this._ram.style = this._ramIcon.style = color(ram);
+        this._ramItem.label.text = `RAM: ${ram}% (${gib(mem.used)} of ${gib(mem.total)} GiB)`;
+
+        const gpu = this._gpu;
+        const off = gpu === 'off';
+        this._gpuTemp.text = gpu === undefined ? '…' : off ? 'off' : `${gpu ?? '—'}°`;
+        this._gpuTemp.style = this._gpuIcon.style = typeof gpu === 'number' ? tempColor(gpu) : '';
+        this._gpuItem.label.text = off ? 'GPU: sleeping' : `GPU: ${gpu ?? '—'} °C`;
+
+        this._diskBusy.text = `${io.busy}%`;
+        this._diskBusy.style = color(io.busy);
+        this._diskRate.text = `${gap('diskBusy')}R ${rate(io.read)} W ${rate(io.written)}`;
+        this._diskSpace.text = space
+            ? `${gap('diskBusy') || gap('diskRate')}${space.pct}% full` : '';
+        this._diskSpace.style = space ? color(space.pct) : '';
+        // Disk icon: the worse of activity and space, among those shown
+        const diskStyles = [
+            this._show('diskBusy') ? color(io.busy) : '',
+            this._show('diskSpace') && space ? color(space.pct) : '',
+        ];
+        this._diskIcon.style = SEVERITY.findLast(c => diskStyles.includes(c)) ?? '';
+        const mbs = b => (b / 1048576).toFixed(1);
+        this._ioItem.label.text =
+            `Disk: ${io.busy}% busy · read ${mbs(io.read)} MB/s · write ${mbs(io.written)} MB/s`;
+        this._spaceItem.label.text = space
+            ? `Space: ${space.pct}% (${gib(space.used / 1024)} of ${gib(space.size / 1024)} GiB)` : 'Space: —';
+        this._spaceItem.label.style = space ? color(space.pct) : '';
+        this._diskItem.label.text = `SSD temperature: ${diskTemp ?? '—'} °C`;
     }
 
     destroy() {
