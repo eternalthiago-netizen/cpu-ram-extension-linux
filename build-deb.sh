@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="${1:-1.2.0}"
+VERSION="${1:-1.3.0}"
 MAINTAINER="eternalthiago-netizen <322351893+eternalthiago-netizen@users.noreply.github.com>"
 BUILD=build
 rm -rf "$BUILD" && mkdir -p "$BUILD" dist
@@ -20,8 +20,9 @@ Maintainer: $MAINTAINER
 Depends: gnome-shell (>= 45)
 Section: gnome
 Priority: optional
-Description: CPU/RAM usage and CPU/GPU temperatures in the GNOME top bar
- Shows CPU and RAM usage and CPU/GPU temperatures in the top bar, with
+Description: CPU/RAM usage, CPU/GPU temperatures and disk activity in the GNOME top bar
+ Shows CPU and RAM usage, CPU/GPU temperatures and disk activity and
+ read/write speed in the top bar, with
  colors for high values; the menu chooses what is shown. Reads /proc and
  /sys directly; uses nvidia-smi for NVIDIA GPUs.
 EOF

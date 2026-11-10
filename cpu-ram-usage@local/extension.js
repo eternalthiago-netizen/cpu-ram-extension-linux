@@ -43,6 +43,45 @@ function gib(kib) {
     return (kib / 1048576).toFixed(1);
 }
 
+// Physical disks only: loop, zram, device-mapper and RAID have no device/ link
+function findDisks() {
+    return listDir('/sys/block').filter(n =>
+        !/^(loop|zram|ram)/.test(n) && GLib.file_test(`/sys/block/${n}/device`, GLib.FileTest.EXISTS));
+}
+
+// Per-disk counters from /proc/diskstats: busy time (ms) and bytes read/written
+// (sectors there are always 512 bytes)
+function readDiskStats(disks) {
+    const stats = {};
+    for (const line of readText('/proc/diskstats').split('\n')) {
+        const f = line.trim().split(/\s+/);
+        if (disks.includes(f[2]))
+            stats[f[2]] = {read: Number(f[5]) * 512, written: Number(f[9]) * 512, busyMs: Number(f[12])};
+    }
+    return stats;
+}
+
+// Short rate for the top bar: 0, 512K, 3.4M, 120M
+function rate(bytesPerSec) {
+    if (bytesPerSec < 1024)
+        return '0';
+    if (bytesPerSec < 1048576)
+        return `${Math.round(bytesPerSec / 1024)}K`;
+    const mb = bytesPerSec / 1048576;
+    return mb < 100 ? `${mb.toFixed(1)}M` : `${Math.round(mb)}M`;
+}
+
+// Space used on the root filesystem, like `df /`: the % leaves out the
+// blocks reserved for root, so it is used / (used + available)
+function rootSpace() {
+    const info = Gio.File.new_for_path('/').query_filesystem_info(
+        'filesystem::size,filesystem::used,filesystem::free', null);
+    const size = info.get_attribute_uint64('filesystem::size');
+    const used = info.get_attribute_uint64('filesystem::used');
+    const avail = info.get_attribute_uint64('filesystem::free');
+    return {size, used, pct: used + avail > 0 ? Math.round(100 * used / (used + avail)) : 0};
+}
+
 function readFirstLine(path) {
     try {
         return readText(path).trim();
@@ -168,10 +207,11 @@ function tempColor(c) {
 
 // What the top bar shows; chosen from the menu and kept across restarts
 const SETTINGS_FILE = GLib.build_filenamev([GLib.get_user_config_dir(), 'cpu-ram-usage.json']);
-const DEFAULTS = {cpu: true, cpuTemp: true, ram: true, gpuTemp: false};
+const DEFAULTS = {cpu: true, cpuTemp: true, ram: true, gpuTemp: false, diskBusy: true, diskRate: true};
 const BAR_OPTIONS = [
     ['cpu', 'CPU usage'], ['cpuTemp', 'CPU temperature'],
     ['ram', 'RAM usage'], ['gpuTemp', 'GPU temperature'],
+    ['diskBusy', 'Disk activity'], ['diskRate', 'Disk read/write'],
 ];
 
 function loadSettings() {
@@ -207,9 +247,10 @@ class Indicator extends PanelMenu.Button {
         };
 
         this._sensors = findTempSensors();
+        this._disks = findDisks();
         this._settings = loadSettings();
 
-        // One group per icon: CPU (usage + temperature), RAM, GPU
+        // One group per icon: CPU (usage + temperature), RAM, GPU, disk
         this._cpuIcon = icon('cpu');
         this._cpu = label('…');
         this._cpuTemp = label('');
@@ -217,11 +258,15 @@ class Indicator extends PanelMenu.Button {
         this._ram = label('…');
         this._gpuIcon = icon('gpu');
         this._gpuTemp = label('…');
+        this._diskIcon = icon('disk');
+        this._diskBusy = label('…');
+        this._diskRate = label('');
         const box = new St.BoxLayout({style_class: 'panel-status-menu-box'});
         this._groups = [
             [this._cpuIcon, this._cpu, this._cpuTemp],
             [this._ramIcon, this._ram],
             [this._gpuIcon, this._gpuTemp],
+            [this._diskIcon, this._diskBusy, this._diskRate],
         ].map(children => {
             const group = new St.BoxLayout();
             for (const c of children)
@@ -235,15 +280,19 @@ class Indicator extends PanelMenu.Button {
         this._ramItem = new PopupMenu.PopupMenuItem('RAM', {reactive: false});
         this._gpuItem = new PopupMenu.PopupMenuItem('GPU', {reactive: false});
         this._diskItem = new PopupMenu.PopupMenuItem('SSD', {reactive: false});
+        this._ioItem = new PopupMenu.PopupMenuItem('Disk', {reactive: false});
+        this._spaceItem = new PopupMenu.PopupMenuItem('Space', {reactive: false});
         this._gpuItem.visible = this._hasGpu();
         this._diskItem.visible = this._sensors.disk !== null;
-        for (const item of [this._cpuItem, this._ramItem, this._gpuItem, this._diskItem])
+        this._ioItem.visible = this._disks.length > 0;
+        for (const item of [this._cpuItem, this._ramItem, this._gpuItem, this._ioItem,
+            this._spaceItem, this._diskItem])
             this.menu.addMenuItem(item);
 
-        // Switches for what the top bar shows (temperatures only if there is a sensor)
+        // Switches for what the top bar shows (only for what this machine has)
         const bar = new PopupMenu.PopupSubMenuMenuItem('Show in top bar');
         for (const [key, text] of BAR_OPTIONS) {
-            if ((key === 'cpuTemp' && !this._sensors.cpu) || (key === 'gpuTemp' && !this._hasGpu()))
+            if (!this._available(key))
                 continue;
             const sw = new PopupMenu.PopupSwitchMenuItem(text, this._settings[key]);
             sw.connect('toggled', (_item, state) => {
@@ -265,6 +314,7 @@ class Indicator extends PanelMenu.Button {
 
         this._layout();
         this._prev = readCpuTimes();
+        this._diskPrev = readDiskStats(this._disks);
         this._update();
         this._timer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, POLL_SECONDS, () => {
             this._update();
@@ -276,12 +326,18 @@ class Indicator extends PanelMenu.Button {
         return this._sensors.gpu !== null || this._sensors.nvidia !== null;
     }
 
+    _available(key) {
+        if (key === 'cpuTemp')
+            return this._sensors.cpu !== null;
+        if (key === 'gpuTemp')
+            return this._hasGpu();
+        if (key === 'diskBusy' || key === 'diskRate')
+            return this._disks.length > 0;
+        return true;
+    }
+
     _show(key) {
-        if (key === 'cpuTemp' && !this._sensors.cpu)
-            return false;
-        if (key === 'gpuTemp' && !this._hasGpu())
-            return false;
-        return this._settings[key];
+        return this._available(key) && this._settings[key];
     }
 
     // Shows only the chosen values; keeps the CPU icon if nothing is chosen,
@@ -292,7 +348,9 @@ class Indicator extends PanelMenu.Button {
         this._cpuTemp.visible = s('cpuTemp');
         this._ram.visible = this._ramIcon.visible = s('ram');
         this._gpuTemp.visible = this._gpuIcon.visible = s('gpuTemp');
-        const shown = [s('cpu') || s('cpuTemp'), s('ram'), s('gpuTemp')];
+        this._diskBusy.visible = s('diskBusy');
+        this._diskRate.visible = s('diskRate');
+        const shown = [s('cpu') || s('cpuTemp'), s('ram'), s('gpuTemp'), s('diskBusy') || s('diskRate')];
         if (!shown.includes(true))
             shown[0] = true;
         let first = true;
@@ -321,10 +379,24 @@ class Indicator extends PanelMenu.Button {
                 const dTotal = cur.total - this._prev.total;
                 const dIdle = cur.idle - this._prev.idle;
                 this._prev = cur;
-                this._sampledAt = now;
                 this._cpuPct = dTotal > 0 ? Math.round(100 * (1 - dIdle / dTotal)) : 0;
+
+                // Disk: busy % of the busiest disk (like iostat %util), bytes/s summed
+                const secs = (now - (this._sampledAt ?? now - POLL_SECONDS * 1e6)) / 1e6;
+                const disk = readDiskStats(this._disks);
+                let busy = 0, read = 0, written = 0;
+                for (const [name, d] of Object.entries(disk)) {
+                    const p = this._diskPrev[name] ?? d;
+                    busy = Math.max(busy, (d.busyMs - p.busyMs) / (secs * 10));
+                    read += d.read - p.read;
+                    written += d.written - p.written;
+                }
+                this._diskPrev = disk;
+                this._io = {busy: Math.min(100, Math.round(busy)), read: read / secs, written: written / secs};
+                this._sampledAt = now;
             }
             const cpu = this._cpuPct;
+            const io = this._io;
 
             const mem = readMemory();
             const ram = mem.total > 0 ? Math.round(100 * mem.used / mem.total) : 0;
@@ -345,7 +417,22 @@ class Indicator extends PanelMenu.Button {
             this._cpuItem.label.text = temp === null ? `CPU: ${cpu}%` : `CPU: ${cpu}% · ${temp} °C`;
             this._ramItem.label.text =
                 `RAM: ${ram}% (${gib(mem.used)} of ${gib(mem.total)} GiB)`;
-            this._diskItem.label.text = `SSD: ${readTemp(this._sensors.disk) ?? '—'} °C`;
+            this._diskItem.label.text = `SSD temperature: ${readTemp(this._sensors.disk) ?? '—'} °C`;
+
+            this._diskBusy.text = `${io.busy}%`;
+            this._diskRate.text = `${this._show('diskBusy') ? ' ' : ''}R ${rate(io.read)} W ${rate(io.written)}`;
+            this._diskBusy.style = this._diskIcon.style = color(io.busy);
+            const mbs = b => (b / 1048576).toFixed(1);
+            this._ioItem.label.text =
+                `Disk: ${io.busy}% busy · read ${mbs(io.read)} MB/s · write ${mbs(io.written)} MB/s`;
+            try {
+                const sp = rootSpace();
+                this._spaceItem.label.text =
+                    `Space: ${sp.pct}% (${gib(sp.used / 1024)} of ${gib(sp.size / 1024)} GiB)`;
+                this._spaceItem.label.style = color(sp.pct);
+            } catch {
+                this._spaceItem.label.text = 'Space: —';
+            }
 
             // GPU: only when shown in the bar or the menu is open (nvidia-smi is a process)
             if (this._hasGpu() && (this._show('gpuTemp') || this.menu.isOpen) && !this._gpuBusy) {
